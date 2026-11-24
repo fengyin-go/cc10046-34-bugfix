@@ -3,11 +3,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from app.services.crawler_config import CrawlerConfigService
 from app.services.crawl_schedule import CrawlScheduleService
 from app.services.batch_tracker import BatchTrackerService
+from app.services.task_ownership import TaskIdentityError
 from app.services.result_store import ResultStoreService
 from app.services.parser_rule import ParserRuleService
 from app.services.field_mapper import FieldMapperService
@@ -55,14 +56,29 @@ def run_crawl_pipeline(payload: dict[str, Any]) -> dict[str, Any]:
     batch_label = payload.get("batch_label", "BATCH-1")
     row_count = payload.get("row_count", 100)
     valid_count = payload.get("valid_count", 95)
+    source_site = payload.get("source_site") or payload.get("site")
+    request_id = payload.get("request_id")
 
     vresult = _crawler.domain_validate_config(config_id)
-    sresult = _schedule.domain_create_schedule(config_name, period)
-    bresult = _batch.domain_track_batch(batch_label, sresult["task_id"])
+    try:
+        requested_task = payload.get("task_id") or payload.get("task_no")
+        sresult = _schedule.domain_create_schedule(
+            config_name, period, task_id=requested_task or None,
+            source_site=source_site)
+    except TaskIdentityError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    try:
+        bresult = _batch.domain_track_batch(
+            batch_label, sresult["task_id"], source_site=source_site,
+            request_id=request_id)
+    except TaskIdentityError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     storeresult = _store.domain_store_result(batch_label, config_name, row_count, valid_count)
 
     return {
         "chain": "crawl-pipeline",
+        "task_id": sresult["task_id"],
+        "source_site": sresult["source_site"],
         "steps": {
             "validate_config": vresult,
             "create_schedule": sresult,

@@ -1,7 +1,9 @@
-"""__NAME__领域服务：字段、状态和动作来自业务配置，数据处理骨架由基类复用。"""
+"""采集调度领域服务：生成和登记调度计划，并保证任务标识可回查、不被复用。"""
 from __future__ import annotations
 
+from app.services import task_ownership
 from app.services.base import BaseModuleService
+from app.services.task_ownership import TaskIdentityError
 
 
 class CrawlScheduleService(BaseModuleService):
@@ -14,19 +16,46 @@ class CrawlScheduleService(BaseModuleService):
     ACTION_RULES = {"启动调度": "待启动", "取消调度": "调度失败"}
     NEGATIVE_ACTIONS = []
 
-    def domain_create_schedule(self, config_name: str, period: str = "daily") -> dict:
-        """生成采集调度计划。"""
-        from app.store import store
-        import time
-        rows = store.rows(self.MODULE)
-        task_id = f"SCHED-{max((int(r.get('id', 0)) for r in rows), default=0) + 1}"
-        plan = {
-            "task_id": task_id,
-            "config_name": config_name,
-            "period": period,
-            "shard_count": 4,
-            "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "watermark_start": "2026-01-01",
-            "watermark_end": time.strftime("%Y-%m-%d"),
-        }
-        return plan
+    def domain_create_schedule(
+        self,
+        config_name: str,
+        period: str = "daily",
+        task_id: str | None = None,
+        source_site: str | None = None,
+    ) -> dict:
+        """生成采集调度计划：任务号独立，来源和实际任务号随计划一起登记。"""
+        return task_ownership.domain_create_schedule(
+            config_name, period, task_id=task_id, source_site=source_site)
+
+    def create_entry(self, values: dict) -> tuple[dict | None, list[str]]:
+        """通用登记入口也走任务号校验：缺省自动分配，重复任务号直接报错。"""
+        self.last_create_error = ""
+        config_name = str(values.get("关联配置") or "").strip()
+        period = str(values.get("调度周期") or "daily").strip() or "daily"
+        if not config_name:
+            return None, ["关联配置"]
+        requested = str(values.get("任务标识") or "").strip()
+        try:
+            plan = self.domain_create_schedule(
+                config_name, period, task_id=requested or None,
+                source_site=str(values.get("来源站点") or "").strip() or None)
+        except TaskIdentityError as error:
+            self.last_create_error = str(error)
+            return None, []
+        entry = plan["schedule_entry"]
+        for field in self.LIST_FIELDS:
+            if values.get(field) not in (None, ""):
+                entry[field] = values.get(field)
+        entry["任务标识"] = plan["task_id"]
+        return entry, []
+
+    def run_action(self, entry_id: int, action: str) -> tuple[dict | None, str]:
+        """启动调度时把计划里的任务号带到执行任务号，便于批次认亲。"""
+        entry, message = super().run_action(entry_id, action)
+        if entry is not None and action == "启动调度":
+            if not str(entry.get("执行任务号") or "").strip():
+                entry["执行任务号"] = task_ownership.allocate_execution_id()
+            message = (
+                f"{self.ENTITY}已{action}，执行任务号 {entry['执行任务号']}"
+                f"（任务号 {entry.get('任务标识')}）")
+        return entry, message

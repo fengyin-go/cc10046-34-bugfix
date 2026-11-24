@@ -16,7 +16,8 @@ class Store:
         }
 
     def module_names(self) -> list[str]:
-        return sorted(self._tables)
+        """只暴露业务模块；下划线开头的是归属凭据等内部辅助表。"""
+        return sorted(name for name in self._tables if not name.startswith("_"))
 
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])
